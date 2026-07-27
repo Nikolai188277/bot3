@@ -26,8 +26,8 @@ import websocket
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-API_KEY = "kdqPPEpDDLVjfZaQkQhtxOQhADs7OIzdFDG8lvfzFKQg6yXn6XQt8YR1u0FYqNV5"
-API_SECRET = "PZ0OE1MOOOvb82gMlWnnq1ZimCer3YnA9QOClUabPK30ZpjstjmYef9JASi2z6ps"
+API_KEY = "Ключ апи"
+API_SECRET = "Секретный код апи"
 
 
 WEIGHTS_FILE = "prediction_weights.json"
