@@ -1,0 +1,1 @@
+-m pip install aiogram pandas numpy python-binance ta scikit-learn torch torchvision torchaudio websocket-client bcrypt aiogram qrcode[pil] pillow
