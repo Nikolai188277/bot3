@@ -1,0 +1,595 @@
+import asyncio
+import logging
+import sys
+import json
+import requests
+from datetime import datetime, timedelta
+import qrcode
+from io import BytesIO
+import traceback
+
+from aiogram import Bot, Dispatcher
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from aiogram.filters import Command
+from aiogram.fsm.storage.memory import MemoryStorage
+
+# ============= НАСТРОЙКИ =============
+TOKEN = "8749459557:AAG63YgTeXs6JCyQOT9fQPMoezD51uzMI5Q"
+ADMIN_ID = 2011993654
+USDT_ADDRESS = "TR18phtEDVdQJutFu7ngjkoW93JasZ7mnd"
+
+SUBSCRIPTION_PRICES = {
+    "monthly": {"days": 30, "price": 1000, "name": "1 месяц"},
+    "quarterly": {"days": 90, "price": 2800, "name": "3 месяца"},
+    "yearly": {"days": 365, "price": 10000, "name": "1 год"}
+}
+
+SUBSCRIPTIONS_FILE = "subscriptions.json"
+USED_TXIDS_FILE = "used_txids.json"
+USERS_FILE = "users.json"
+BANNED_FILE = "banned.json"
+
+bot = Bot(token=TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+sys.path.append('.')
+
+from bot import (
+    predict_symbol,
+    get_futures_pairs,
+    load_json
+)
+
+# Глобальные переменные
+current_horizon = 3600
+use_lstm_mode = True
+weights = {}
+last_pairs_list = []
+keyboard = None
+
+FULL_DISCLAIMER = (
+    "⚠️ <b>Важное предупреждение</b>\n\n"
+    "Прогнозы для <b>Futures USD-М</b>.\n"
+    "Все прогнозы носят исключительно аналитический характер.\n"
+    "Вероятность верного прогноза ≈ 50%.\n" 
+    "Автоматический анализ данных. Не является финансовой рекомендацией\n"
+    "Торговля криптовалютой — высокий риск!\n\n"
+)
+
+# ===================== БАЗА =====================
+def load_data(filename, default=None):
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except:
+        return default or {}
+
+def save_data(filename, data):
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+subscriptions = load_data(SUBSCRIPTIONS_FILE, {})
+used_txids = load_data(USED_TXIDS_FILE, {})
+users_db = load_data(USERS_FILE, {})
+banned_users = load_data(BANNED_FILE, [])
+
+# ===================== ПОДПИСКИ =====================
+def is_user_active(user_id: int) -> bool:
+    if user_id == ADMIN_ID: return True
+    if user_id in banned_users: return False
+    sub = subscriptions.get(str(user_id))
+    if not sub: return False
+    try:
+        end_date = datetime.fromisoformat(sub["end_date"].replace("Z", ""))
+        return end_date > datetime.utcnow()
+    except:
+        return False
+
+def get_subscription_info(user_id: int):
+    if user_id == ADMIN_ID:
+        return "♾️ Администратор — безлимит"
+    if user_id in banned_users:
+        return "⛔ Вы заблокированы"
+    sub = subscriptions.get(str(user_id))
+    if not sub:
+        return "❌ Нет активной подписки"
+    try:
+        end = datetime.fromisoformat(sub["end_date"].replace("Z", ""))
+        days_left = max(0, (end - datetime.utcnow()).days + 1)
+        return f"✅ Активна до {end.strftime('%d.%m.%Y')} ({days_left} дней)"
+    except:
+        return "❌ Ошибка подписки"
+
+def activate_subscription(user_id: int, days: int = 30, plan: str = "paid"):
+    user_str = str(user_id)
+    end_date = datetime.utcnow() + timedelta(days=days)
+    subscriptions[user_str] = {"end_date": end_date.isoformat() + "Z", "plan": plan}
+    save_data(SUBSCRIPTIONS_FILE, subscriptions)
+
+def remove_subscription(user_id: int):
+    user_str = str(user_id)
+    if user_str in subscriptions:
+        del subscriptions[user_str]
+        save_data(SUBSCRIPTIONS_FILE, subscriptions)
+
+def ban_user(user_id: int):
+    if user_id not in banned_users:
+        banned_users.append(user_id)
+        save_data(BANNED_FILE, banned_users)
+
+def unban_user(user_id: int):
+    if user_id in banned_users:
+        banned_users.remove(user_id)
+        save_data(BANNED_FILE, banned_users)
+
+def save_user(user):
+    user_id = str(user.id)
+    if user_id not in users_db:
+        users_db[user_id] = {
+            "user_id": user.id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "first_start": datetime.utcnow().isoformat(),
+        }
+        save_data(USERS_FILE, users_db)
+
+# ===================== TxID =====================
+def is_txid_used(txid: str) -> bool:
+    return txid in used_txids
+
+def mark_txid_as_used(txid: str, user_id: int, amount: float, plan: str):
+    used_txids[txid] = {
+        "user_id": user_id,
+        "amount": amount,
+        "plan": plan,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    save_data(USED_TXIDS_FILE, used_txids)
+
+# ===================== ПРОВЕРКА ОПЛАТЫ =====================
+def check_tron_transaction(txid: str, user_id: int):
+    if is_txid_used(txid):
+        return False, "❌ Эта транзакция уже была использована", 0
+
+    try:
+        url = "https://api.trongrid.io/wallet/gettransactionbyid"
+        response = requests.post(url, json={"value": txid}, timeout=15)
+        data = response.json()
+
+        if not data or 'raw_data' not in data:
+            return False, "❌ Транзакция не найдена", 0
+
+        received_amount = 0.0
+        for contract in data.get('raw_data', {}).get('contract', []):
+            if contract.get('type') == 'TriggerSmartContract':
+                param = contract.get('parameter', {}).get('value', {})
+                if param.get('contract_address') == "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t":
+                    if param.get('to_address', '').upper() == USDT_ADDRESS.upper():
+                        received_amount = int(param.get('amount', 0)) / 1_000_000
+                        break
+
+        if received_amount == 0:
+            return False, "❌ Не найдено USDT на адрес", 0
+
+        for plan_key, plan in SUBSCRIPTION_PRICES.items():
+            if abs(received_amount - plan["price"]) < 0.01:
+                mark_txid_as_used(txid, user_id, received_amount, plan_key)
+                activate_subscription(user_id, plan["days"], plan_key)
+                return True, f"✅ Оплата {received_amount} USDT подтверждена!\nПодписка **{plan['name']}** активирована!", received_amount
+
+        closest = min(SUBSCRIPTION_PRICES.values(), key=lambda p: abs(p["price"] - received_amount))
+        expected = closest["price"]
+
+        if received_amount < expected:
+            missing = expected - received_amount
+            return False, f"⚠️ Недостаточно!\nПолучено: {received_amount} USDT\nНужно: {expected} USDT\nДоплатите: **{missing:.2f}** USDT", received_amount
+        else:
+            extra = received_amount - expected
+            mark_txid_as_used(txid, user_id, received_amount, "yearly")
+            activate_subscription(user_id, closest["days"])
+            return True, f"✅ Получено {received_amount} USDT (переплата {extra:.2f})\nПодписка активирована!", received_amount
+
+    except Exception as e:
+        return False, f"❌ Ошибка проверки: {str(e)}", 0
+
+# ===================== АДМИН КОМАНДЫ =====================
+@dp.message(Command("admin"))
+async def admin_panel(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("⛔ Доступ запрещён.")
+        return
+    active = len([u for u in subscriptions if is_user_active(int(u))])
+    await message.answer(f"""
+👑 <b>Админ-панель</b>
+
+📊 Статистика:
+• Пользователей: <b>{len(users_db)}</b>
+• Активных подписок: <b>{active}</b>
+• Заблокировано: <b>{len(banned_users)}</b>
+
+🔧 Команды:
+• /addsub <id> <days>
+• /delsub <id>
+• /ban <id>
+• /unban <id>
+• /broadcast <текст>
+• /listsubs
+• /users
+• /usedtx
+• /status
+    """, parse_mode="HTML")
+
+
+@dp.message(Command("addsub"))
+async def add_subscription(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        _, uid, days = message.text.split()
+        activate_subscription(int(uid), int(days))
+        await message.answer(f"✅ Подписка на {days} дней добавлена пользователю <code>{uid}</code>", parse_mode="HTML")
+    except:
+        await message.answer("❌ Формат: /addsub <user_id> <days>")
+
+
+@dp.message(Command("delsub"))
+async def del_subscription(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        _, uid = message.text.split()
+        remove_subscription(int(uid))
+        await message.answer(f"✅ Подписка пользователя <code>{uid}</code> удалена", parse_mode="HTML")
+    except:
+        await message.answer("❌ Формат: /delsub <user_id>")
+
+
+@dp.message(Command("ban"))
+async def ban_user_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        _, uid = message.text.split()
+        ban_user(int(uid))
+        await message.answer(f"✅ Пользователь <code>{uid}</code> заблокирован")
+    except:
+        await message.answer("❌ Формат: /ban <user_id>")
+
+
+@dp.message(Command("unban"))
+async def unban_user_cmd(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        _, uid = message.text.split()
+        unban_user(int(uid))
+        await message.answer(f"✅ Пользователь <code>{uid}</code> разблокирован")
+    except:
+        await message.answer("❌ Формат: /unban <user_id>")
+
+
+@dp.message(Command("broadcast"))
+async def broadcast(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    text = message.text.replace("/broadcast", "").strip()
+    if not text:
+        await message.answer("❌ Напишите текст сообщения после команды.\nПример: `/broadcast Всем привет!`")
+        return
+
+    sent = 0
+    for uid_str in users_db.keys():
+        try:
+            await bot.send_message(int(uid_str), text, parse_mode="HTML")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except:
+            continue
+    await message.answer(f"✅ Рассылка завершена!\nОтправлено: {sent} пользователям")
+
+
+@dp.message(Command("listsubs"))
+async def list_subscriptions(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    if not subscriptions:
+        await message.answer("Подписок нет.")
+        return
+    text = "📋 <b>Активные подписки:</b>\n\n"
+    for uid, sub in subscriptions.items():
+        try:
+            end = datetime.fromisoformat(sub["end_date"].replace("Z", ""))
+            days_left = (end - datetime.utcnow()).days
+            text += f"<code>{uid}</code> → {end.strftime('%d.%m.%Y')} ({days_left} дней)\n"
+        except:
+            text += f"<code>{uid}</code> — ошибка\n"
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("users"))
+async def show_users(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    if not users_db:
+        await message.answer("Пользователей нет.")
+        return
+    text = "👥 <b>Последние пользователи:</b>\n\n"
+    for uid, data in list(users_db.items())[-30:]:
+        username = "@" + data.get("username", "") if data.get("username") else "—"
+        text += f"<code>{uid}</code> | {username} | {data.get('first_name','')}\n"
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("usedtx"))
+async def show_used_txids(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    if not used_txids:
+        await message.answer("TxID пока нет.")
+        return
+    text = "📋 <b>Последние TxID:</b>\n\n"
+    for tx, info in list(used_txids.items())[-15:]:
+        text += f"`{tx[:16]}...` → {info['user_id']} ({info['amount']} USDT)\n"
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("status"))
+async def bot_status(message: Message):
+    if message.from_user.id != ADMIN_ID: return
+    active = len([u for u in subscriptions if is_user_active(int(u))])
+    await message.answer(f"✅ Бот работает\nПользователей: {len(users_db)}\nАктивных подписок: {active}\nЗаблокировано: {len(banned_users)}")
+
+# ===================== QR =====================
+def generate_usdt_qr(amount: float, user_id: int):
+    memo = f"bot_{user_id}_{int(datetime.utcnow().timestamp())}"
+    qr = qrcode.QRCode(version=1, box_size=10, border=4)
+    qr.add_data(f"tron:{USDT_ADDRESS}?amount={amount}&memo={memo}")
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    bio = BytesIO()
+    img.save(bio, format="PNG")
+    bio.seek(0)
+    return bio, memo
+
+# ===================== КЛАВИАТУРА =====================
+async def create_main_keyboard():
+    global keyboard
+    try:
+        pairs = get_futures_pairs()
+        buttons = [[KeyboardButton(text=f"🔮 {pair}")] for pair in pairs[:3]]
+        buttons.extend([
+            [KeyboardButton(text="📋 Показать все монеты")],
+            [KeyboardButton(text="📊 Другая монета")],
+            [KeyboardButton(text="💰 Подписка")],
+            [KeyboardButton(text="⏱ 1ч"), KeyboardButton(text="⏱ 4ч"), KeyboardButton(text="⏱ 12ч")],
+            [KeyboardButton(text="🧠 LSTM: ВКЛ" if use_lstm_mode else "🧠 LSTM: ВЫКЛ")]
+        ])
+        
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=buttons,
+            resize_keyboard=True,
+            is_persistent=True,           # ← Важно для Desktop
+            input_field_placeholder="Выберите монету или команду..."
+        )
+    except:
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="🔮 BTCUSDT")]],
+            resize_keyboard=True,
+            is_persistent=True
+        )
+
+# ===================== LSTM + ВРЕМЯ =====================
+@dp.message(lambda m: m.text and "LSTM" in m.text)
+async def toggle_lstm(message: Message):
+    global use_lstm_mode
+    use_lstm_mode = not use_lstm_mode
+    await message.answer(f"🧠 LSTM **{'ВКЛ' if use_lstm_mode else 'ВЫКЛ'}**", parse_mode="HTML")
+    await create_main_keyboard()
+    reply_markup=keyboard
+
+@dp.message(lambda m: m.text in ["⏱ 1ч", "⏱ 4ч", "⏱ 12ч"])
+async def change_horizon(message: Message):
+    global current_horizon
+    if "1ч" in message.text: current_horizon = 3600
+    elif "4ч" in message.text: current_horizon = 14400
+    elif "12ч" in message.text: current_horizon = 43200
+    await message.answer(f"✅ Время прогноза изменено на <b>{current_horizon // 3600} часов</b>", parse_mode="HTML")
+
+# ===================== ПРОГНОЗ =====================
+async def predict_handler(message: Message, symbol: str):
+    if not is_user_active(message.from_user.id):
+        await message.answer("⛔ Доступ закрыт.\nНажмите «💰 Подписка»", parse_mode="HTML")
+        return
+
+    symbol = symbol.upper().strip()
+    if not any(symbol.endswith(x) for x in ["USDT", "USDC", "BUSD"]):
+        symbol += "USDT"
+
+    await message.answer(
+        FULL_DISCLAIMER + f"⏳ Анализирую <b>{symbol}</b> на {current_horizon // 3600} час...",
+        parse_mode="HTML"
+    )
+
+    try:
+        global weights
+        weights = load_json("prediction_weights.json")
+
+        result = predict_symbol(
+            symbol=symbol,
+            horizon_seconds=current_horizon,
+            use_lstm=use_lstm_mode,
+            use_n_candles=False,
+            weights_dict=weights,
+            history_limit=None,
+            n_candles=500,
+            use_dev_forecast=False
+        )
+
+        if not result:
+            await message.answer("❌ Не удалось получить данные по символу.")
+            return
+
+        text = f"""
+📊 <b>{result.get('symbol', symbol)}</b> — Прогноз на <b>{current_horizon // 3600}ч</b>
+
+🔼 <b>Up:</b>   <b>{result.get('up_prob', 0)}%</b>
+🔽 <b>Down:</b> <b>{result.get('down_prob', 0)}%</b>
+📊 <b>Diff:</b> <b>{result.get('prob_diff', 0)}%</b>
+
+💰 <b>Текущая цена:</b> <b>${result.get('current_price', '—')}</b>
+🧠 <b>Модель:</b> RandomForest {'+ LSTM' if use_lstm_mode else ''}
+
+📈 <b>Дополнительные данные:</b>
+• Long Volume: <b>{result.get('long_volume', 0):,}</b>
+• Short Volume: <b>{result.get('short_volume', 0):,}</b>
+• Funding Rate: <b>{result.get('current_funding_rate', 0)} bps</b>
+• Funding MA: <b>{result.get('funding_rate_ma', 0)} bps</b>
+• Long/Short Ratio: <b>{result.get('long_short_ratio', 1.0)}</b>
+• Open Interest: <b>{result.get('oi', 0):,}</b>
+
+📊 <b>Историческая точность:</b> {result.get('accuracy', 0)}% | Стрик: {result.get('streak', 0)}
+        """.strip()
+
+        # ==================== КНОПКИ ====================
+        ref_code = "EDO336NQ"
+        futures_url = f"https://www.binance.com/en/futures/{symbol}?ref={ref_code}"
+        spot_url = f"https://www.binance.com/en/trade/{symbol}?ref={ref_code}"
+
+        inline_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🚀 Торговать {symbol} на Futures Binance", url=futures_url)],
+            [InlineKeyboardButton(text=f"🚀 Торговать {symbol} на Spot Binance", url=spot_url)]
+        ])
+
+        await message.answer(text, parse_mode="HTML", reply_markup=inline_kb)
+
+    except Exception as e:
+        if "Invalid symbol" in str(e):
+            await message.answer(f"❌ Неправильный символ: <b>{symbol}</b>")
+        else:
+            await message.answer("❌ Ошибка при расчёте прогноза.")
+        traceback.print_exc()
+
+# ===================== ОСНОВНЫЕ ОБРАБОТЧИКИ =====================
+@dp.message(Command("start"))
+async def start(message: Message):
+    save_user(message.from_user)
+    info = get_subscription_info(message.from_user.id)
+
+    text = (
+            FULL_DISCLAIMER +
+            f"{info}\n\n"
+            "Выберите монету в главном меню👇\n\n"
+            "Если у вас нет аккаунта на бирже — создайте его прямо сейчас!"
+    )
+
+    # Inline-кнопка создания аккаунта
+    inline_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🔗 Создать аккаунт на Binance",
+            url="https://www.binance.com/referral/earn-together/refer2earn-usdc/claim?hl=ru&ref=GRO_28502_IS5P1&utm_source=referral_entrance"
+        )]
+    ])
+
+    # 1. Отправляем сообщение с inline-кнопкой
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=inline_kb
+    )
+
+    # 2. Отправляем основную клавиатуру отдельным сообщением
+    if keyboard:
+        await asyncio.sleep(0.3)  # небольшая задержка для корректного отображения
+        await message.answer(
+            "Выберите монету 👇",
+            reply_markup=keyboard
+        )
+
+@dp.message(lambda m: m.text == "💰 Подписка")
+async def subscription_menu(message: Message):
+    info = get_subscription_info(message.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"1 месяц — {SUBSCRIPTION_PRICES['monthly']['price']} USDT", callback_data="pay_monthly")],
+        [InlineKeyboardButton(text=f"3 месяца — {SUBSCRIPTION_PRICES['quarterly']['price']} USDT", callback_data="pay_quarterly")],
+        [InlineKeyboardButton(text=f"1 год — {SUBSCRIPTION_PRICES['yearly']['price']} USDT", callback_data="pay_yearly")],
+    ])
+    await message.answer(f"💰 <b>Подписка USDT TRC20</b>\n\n{info}", parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(lambda c: c.data.startswith("pay_"))
+async def process_payment(callback):
+    plan_key = callback.data.replace("pay_", "")
+    plan = SUBSCRIPTION_PRICES.get(plan_key)
+    if not plan: return
+    qr_bio, _ = generate_usdt_qr(plan["price"], callback.from_user.id)
+    caption = f"🧾 <b>Оплата: {plan['name']}</b>\n\n💰 {plan['price']} USDT (TRC20)\n\nПришлите TxID"
+    photo = BufferedInputFile(qr_bio.getvalue(), filename="qr.png")
+    await callback.message.delete()
+    await callback.message.answer_photo(photo, caption=caption, parse_mode="HTML")
+
+@dp.message(lambda m: m.text and m.text.startswith("🔮"))
+async def button_predict(message: Message):
+    symbol = message.text.replace("🔮", "").strip()
+    await predict_handler(message, symbol)
+
+@dp.message(lambda m: m.text == "📋 Показать все монеты")
+async def show_all_pairs(message: Message):
+    global last_pairs_list
+    try:
+        pairs = get_futures_pairs()
+        last_pairs_list = pairs[:]
+        await message.answer(f"📋 Найдено <b>{len(pairs)}</b> активных пар.\n\nОтправь номер монеты:", parse_mode="HTML")
+
+        text = ""
+        for i, p in enumerate(pairs, 1):
+            text += f"<b>{i}.</b> {p}\n"
+            if i % 20 == 0:
+                await message.answer(text, parse_mode="HTML")
+                text = ""
+                await asyncio.sleep(0.7)
+        if text:
+            await message.answer(text, parse_mode="HTML")
+        await message.answer("🔢 <b>Напиши номер монеты:</b>", parse_mode="HTML")
+    except:
+        await message.answer("❌ Не удалось загрузить список")
+
+@dp.message(lambda m: m.text and m.text.strip().isdigit())
+async def handle_number_choice(message: Message):
+    global last_pairs_list
+    if not last_pairs_list:
+        await message.answer("❌ Сначала нажми «📋 Показать все монеты»")
+        return
+    try:
+        num = int(message.text.strip())
+        if num < 1 or num > len(last_pairs_list):
+            await message.answer("❌ Неверный номер!")
+            return
+        symbol = last_pairs_list[num - 1]
+        await predict_handler(message, symbol)
+    except:
+        await message.answer("❌ Ошибка")
+
+@dp.message(lambda m: m.text == "📊 Другая монета")
+async def other_coin(message: Message):
+    await message.answer(
+        "✅ **Режим свободного ввода включён**\n\nПросто напиши название пары:\n• `BTCUSDT`\n• `ETH`\n• `SOL` и т.д.",
+        parse_mode="Markdown"
+    )
+
+@dp.message()
+async def free_symbol_input(message: Message):
+    if not message.text: return
+    text = message.text.strip().upper()
+
+    if len(text) == 64 and text.isalnum():  # TxID
+        await message.answer("🔍 Проверяю транзакцию...")
+        success, msg, _ = check_tron_transaction(text, message.from_user.id)
+        await message.answer(msg)
+        return
+
+    if len(text) >= 2 and text.isalnum():
+        await predict_handler(message, text)
+
+# ===================== ЗАПУСК =====================
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    global weights
+    weights = load_json("prediction_weights.json")
+    await create_main_keyboard()
+    print("🚀 Бот запущен успешно")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
